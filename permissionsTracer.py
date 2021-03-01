@@ -313,6 +313,10 @@ class IntentFilterAnalyzer:
         Method to get all the cross references from a
         method object, the class name must appear in
         the cross reference in order to be included.
+
+        :param method_object: method of which we will extract the cross references.
+        :param class_name: only the cross references done from this class will be retrieved.
+        :return: list of cross references.
         """
         xrefs = []
         all_xrefs = method_object.get_xref_from()
@@ -324,6 +328,42 @@ class IntentFilterAnalyzer:
                 xrefs.append(call)
 
         return xrefs
+
+    def _get_intent_actions(self, class_name: str, component_type: str):
+        '''
+        Method to retrieve from the AndroidManifest all the action
+        names that the class will respond to. We will focus on those
+        actions from AOSP. These together with the return types
+        could be useful to see what data is retrieved from a component.
+
+        :param class_name: class to search in the manifest to retrieve the intent actions.
+        :param component_type: string with type of the component.
+        :return: list[str]
+        '''
+        element = self.apk.get_android_manifest_xml()
+        application = element.find('application')
+
+        actions = set()
+
+        component_to_analyze = None
+
+        class_name = class_name.replace('/', '.')[1:-1]
+
+        for component in application.findall(component_type):
+            if component.attrib['{http://schemas.android.com/apk/res/android}name'] == class_name:
+                component_to_analyze = component
+                break
+
+        if component_to_analyze is None:
+            return []
+
+        for intent_filter in component_to_analyze.findall('intent-filter'):
+            for action in intent_filter.findall('action'):
+                actions.add(
+                    action.attrib['{http://schemas.android.com/apk/res/android}name'])
+
+        return list(actions)
+
     '''
     Methods to analyze methods exported by a service
     in order to get what a Service "could" leak through
@@ -407,6 +447,88 @@ class IntentFilterAnalyzer:
                     classes_returned_by_method.append(class_object)
 
         return classes_returned_by_method
+
+    def _get_types_from_set_result(self, method_object: MethodAnalysis, class_name: str):
+        '''
+        The method setResult from the Intent is used to return data from an
+        Activity or BroadcastReceiver called (also through an intent) through
+        the intent extras, this method does a backward analysis of the calls
+        to setResult to extract all the extras. The output of the method will
+        return a list of dictionaries being each key the name of the extra
+        and the value is the type the extra returns.
+
+        :param method_object: MethodAnalysis of the setResult method.
+        :param class_name: class where to find for references to the method.
+        :return: list[dict]
+        '''
+        method_xrefs = self._get_references_to_method(
+            method_object=method_object, class_name=class_name)
+        return_values = []
+
+        if len(method_xrefs) == 0:
+            return []
+
+        for method in method_xrefs:
+            # analyze the method where 'setResult' is called.
+            method_instructions = []
+            for block in method.get_basic_blocks():
+                for inst in block.get_instructions():
+                    method_instructions.append(inst)
+
+            for i in range(len(method_instructions)):
+                # look for an invoke-virtual instruction
+                # of the setResult method.
+                inst = method_instructions[i]
+
+                # get those invoke-virtual
+                # with operands
+                # where the called function is setResult
+                # and finally it contains and intent (return results)
+                if inst.get_op_value() == 0x6e and \
+                    len(inst.get_operands()) > 0 and \
+                    'setResult' in str(inst.get_operands()[-1][-1]) and \
+                        '(I Landroid/content/Intent;)' in str(inst.get_operands()[-1][-1]):
+
+                    Debug.log(
+                        "Found instruction invoke-virtual instruction: '%s'" % (inst.disasm()))
+
+                    intent_register = inst.get_operands()[-2][1]
+                    Debug.log("Register with intent: '%d'" % (intent_register))
+
+                    # start backward analysis
+                    for j in range(i, -1, -1):
+                        if method_instructions[j].get_op_value() == 0x6e and \
+                            len(method_instructions[j].get_operands()) > 0 and \
+                                'putExtra' in str(method_instructions[j].get_operands()[-1][-1]):
+
+                            # if the intent is not the one we want...
+                            # leave
+                            if method_instructions[j].get_operands()[0][1] != intent_register:
+                                break
+
+                            put_extra_type = self._get_types_as_list(
+                                method_instructions[j].get_operands()[-1][-1].split('(')[1].split(')')[0])[-1]
+                            key = ""
+
+                            # search for the key in previous instructions
+                            # for the moment support const-string need to
+                            # add support for other ways to get strings
+                            if method_instructions[j-1].get_op_value() == 0x1a:
+                                key = str(
+                                    method_instructions[j-1].get_operands()[-1][-1])
+                            elif method_instructions[j-2].get_op_value() == 0x1a:
+                                key = str(
+                                    method_instructions[j-2].get_operands()[-1][-1])
+                            elif method_instructions[j-3].get_op_value() == 0x1a:
+                                key = str(
+                                    method_instructions[j-3].get_operands()[-1][-1])
+
+                            Debug.log(
+                                "Found 'putExtra' call with key-type: '%s'-'%s'" % (key, put_extra_type))
+
+                            return_values.append({key: put_extra_type})
+
+        return return_values
 
     def _analyze_service(self, class_name: str):
         """
@@ -516,52 +638,29 @@ class IntentFilterAnalyzer:
     def _analyze_broadcast_receiver(self, class_name: str):
         """
         Method to analyze a broadcast receiver.
-        It first analyzes the `onReceive()` method, retrieves its return type
-        and the methods prototypes.
+        In the same way than with Activities, 
 
         :param class_name: str with class name to extract information.
         :return: List
         """
 
         class_object = self._get_class_from_analysis(class_name)
-        method_prototypes = []
+        return_vaues = []
 
         if class_object is None:
             return []
 
         # Search for onReceive method
         method_object = self._get_method_from_class_object(
-            class_object=class_object, method_name="onReceive")
+            class_object=class_object, method_name="setResult")
 
         if method_object is None:
             return []
 
-        returned_classes = self._get_method_returned_classes(
-            method_object=method_object)
+        return_vaues = self._get_types_from_set_result(
+            method_object=method_object, class_name=class_name)
 
-        # we have in returned classes a list of classes that
-        # are returned by onBind method
-        for class_ in returned_classes:
-            for method in class_.get_methods():
-                if method.is_external():
-                    # as the returned classes are interfaces
-                    # return the external methods
-                    descriptor = method.descriptor
-
-                    # get the return type
-                    ret_type = self._get_types_as_list(
-                        descriptor.split(')')[1])[0]
-                    parameters = self._get_types_as_list(
-                        descriptor.split(')')[0])
-
-                    method_prototypes.append(
-                        {str(method.name): {
-                            "return-type": ret_type,
-                            "parameters": parameters
-                        }}
-                    )
-
-        return method_prototypes
+        return return_vaues
 
     def _analyze_activity(self, class_name: str):
         """
@@ -589,71 +688,8 @@ class IntentFilterAnalyzer:
         if method_object is None:
             return []
 
-        methods_xrefs = self._get_references_to_method(
+        return_values = self._get_types_from_set_result(
             method_object=method_object, class_name=class_name)
-
-        if len(methods_xrefs) == 0:
-            return []
-
-        for method in methods_xrefs:
-            # analyze the method where 'setResult' is called.
-            method_instructions = []
-            for block in method.get_basic_blocks():
-                for inst in block.get_instructions():
-                    method_instructions.append(inst)
-
-            for i in range(len(method_instructions)):
-                # look for an invoke-virtual instruction
-                # of the setResult method.
-                inst = method_instructions[i]
-
-                # get those invoke-virtual
-                # with operands
-                # where the called function is setResult
-                # and finally it contains and intent (return results)
-                if inst.get_op_value() == 0x6e and \
-                    len(inst.get_operands()) > 0 and \
-                    'setResult' in str(inst.get_operands()[-1][-1]) and \
-                        '(I Landroid/content/Intent;)' in str(inst.get_operands()[-1][-1]):
-
-                    Debug.log(
-                        "Found instruction invoke-virtual instruction: '%s'" % (inst.disasm()))
-
-                    intent_register = inst.get_operands()[-2][1]
-                    Debug.log("Register with intent: '%d'" % (intent_register))
-
-                    # start backward analysis
-                    for j in range(i, -1, -1):
-                        if method_instructions[j].get_op_value() == 0x6e and \
-                            len(method_instructions[j].get_operands()) > 0 and \
-                                'putExtra' in str(method_instructions[j].get_operands()[-1][-1]):
-
-                            # if the intent is not the one we want...
-                            # leave
-                            if method_instructions[j].get_operands()[0][1] != intent_register:
-                                break
-
-                            put_extra_type = self._get_types_as_list(
-                                method_instructions[j].get_operands()[-1][-1].split('(')[1].split(')')[0])[-1]
-                            key = ""
-
-                            # search for the key in previous instructions
-                            # for the moment support const-string need to
-                            # add support for other ways to get strings
-                            if method_instructions[j-1].get_op_value() == 0x1a:
-                                key = str(
-                                    method_instructions[j-1].get_operands()[-1][-1])
-                            elif method_instructions[j-2].get_op_value() == 0x1a:
-                                key = str(
-                                    method_instructions[j-2].get_operands()[-1][-1])
-                            elif method_instructions[j-3].get_op_value() == 0x1a:
-                                key = str(
-                                    method_instructions[j-3].get_operands()[-1][-1])
-
-                            Debug.log(
-                                "Found 'putExtra' call with key-type: '%s'-'%s'" % (key, put_extra_type))
-
-                            return_values.append({key: put_extra_type})
 
         return return_values
 
@@ -671,25 +707,33 @@ class IntentFilterAnalyzer:
         Debug.log("Component type to analyze is '%s'" % (str(component_type)))
 
         if component_type == self.ComponentTypes.ACTIVITY:
-            self.exposed_methods = {'interface': {}}
-            self.data_provided = {'data_provided': self._analyze_activity(class_name)}
+            self.exposed_methods = {'interface': {},
+                                    'intent-filter_actions': self._get_intent_actions(class_name, 'activity')}
+            self.data_provided = {
+                'data_provided': self._analyze_activity(class_name)}
         elif component_type == self.ComponentTypes.SERVICE:
-            self.exposed_methods = {'interface': self._analyze_service(class_name)}
+            self.exposed_methods = {
+                'interface': self._analyze_service(class_name),
+                'intent-filter_actions': self._get_intent_actions(class_name, 'service')}
             self.data_provided = {'data_provided': {}}
         elif component_type == self.ComponentTypes.PROVIDER:
-            self.exposed_methods = {'interface': {}}
+            self.exposed_methods = {'interface': {},
+                                    'intent-filter_actions': self._get_intent_actions(class_name, 'provider')}
             cp_data_type = self._analyze_content_provider(class_name)
             length = len(cp_data_type)
             self.data_provided = {'data_provided': {
                 'cp_data_{}'.format(i): cp_data_type[i] for i in range(0, length)}}
         elif component_type == self.ComponentTypes.RECEIVER:
-            self.exposed_methods = {'interface': self._analyze_broadcast_receiver(class_name)}
-            self.data_provided = {'data_provided': {}}
+            self.exposed_methods = {
+                'interface': {},
+                'intent-filter_actions': self._get_intent_actions(class_name, 'receiver')}
+            self.data_provided = {
+                'data_provided': self._analyze_broadcast_receiver(class_name)}
         else:
             self.exposed_methods = {'interface': {}}
             self.data_provided = {'data_provided': {}}
 
-        return self.exposed_methods, self.data_provided, {'component_type':str(component_type)}
+        return self.exposed_methods, self.data_provided, {'component_type': str(component_type)}
 
 
 class PermissionTracer:
