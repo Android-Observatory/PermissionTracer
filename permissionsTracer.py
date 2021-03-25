@@ -25,6 +25,8 @@ if len(config.sections()) == 0:
         sys.exit(1)
 
     from androguard.core.analysis.analysis import Analysis, ClassAnalysis, MethodAnalysis
+    from androguard.core.analysis.analysis import FieldAnalysis
+    from androguard.decompiler.decompiler import DecompilerDAD
     from androguard.misc import AnalyzeAPK
     from androguard.misc import AnalyzeDex
 
@@ -47,6 +49,8 @@ else:
     sys.path = [dextripador_path] + sys.path
 
     from androguard.core.analysis.analysis import Analysis, ClassAnalysis, MethodAnalysis
+    from androguard.core.analysis.analysis import FieldAnalysis
+    from androguard.decompiler.decompiler import DecompilerDAD
     from androguard.misc import AnalyzeAPK
     from androguard.misc import AnalyzeDex
     from androguard.core.analysis.analysis import ExternalClass
@@ -125,7 +129,7 @@ class IntentFilterAnalyzer:
             else:
                 return "Not Supported"
 
-    def __init__(self, apk_analysis: Analysis, apk: APK):
+    def __init__(self, apk_analysis: Analysis, apk: APK, classes_dex: list):
         """
         Constructor method for IntentFilterAnalyzer, initialization
         of variables is done here.
@@ -136,6 +140,8 @@ class IntentFilterAnalyzer:
         """
         self.apk_analysis = apk_analysis
         self.apk = apk
+        self.classes_dex = classes_dex
+        self.decompiler = DecompilerDAD(classes_dex, apk_analysis)
         self.exposed_methods = {}
         self.data_provided = {}
         self.component_type = {}
@@ -188,6 +194,8 @@ class IntentFilterAnalyzer:
         """
         Return a ClassAnalysis object from a given class name inside
         of the analysis object.
+        Format of class_name must be:
+            "L<class_name>;"
 
         :param class_name: str with class name to obtain object.
         :return: ClassAnalysis
@@ -370,6 +378,108 @@ class IntentFilterAnalyzer:
     an intent.
     '''
 
+    def _analyze_assignment(self, assignment_node: list, field_name: str):
+        '''
+        Analyze the Assignment statements from Androguard AST
+        here we will extract which type of object is assigned
+        to given field. This is necessary as Java can use base
+        classes and access different methods due to polymorphism.
+
+        :param assignment_node: node from the AST to analyze.
+        :param field_name: field that we look for.
+        :return: class name of object assigned to field, None if not found.
+        '''
+        left_part = assignment_node[0]
+        right_part = assignment_node[1]
+
+        # check left part of the assignment instruction
+        # this must be a FieldAccess and the field must be
+        # the one we are looking for
+        if left_part[0] != "FieldAccess" or \
+                str(left_part[2][1]) != field_name:
+            return None
+
+        # analyze right part, for the moment check for ClassInstanceCreation
+        if right_part[0] == "ClassInstanceCreation" and \
+                right_part[-1][0] == "TypeName":
+            Debug.log("Found assignment to '%s' with object from class '%s'" % (
+                field_name, right_part[-1][1][0]))
+            return str(right_part[-1][1][0])
+
+        return None
+
+    def _find_assignments(self, node: list, field_name: str):
+        '''
+        Given an ExpressionStatement node check if current
+        node is an Assignment from AST.
+
+        :param node: list with node currently analyzed.
+        :param field_name: field that we look for.
+        :return: class name of object assigned to field, None if not found.
+        '''
+        Debug.log("Analyzing node type '%s'" % (node[0]))
+        if node[0] == 'Assignment':
+            # analyze
+            return self._analyze_assignment(node[1], field_name)
+
+        else:
+            return None
+
+    def _analyze_blockstatement(self, node: list, field_name: str):
+        """
+        Analyze all the statements of a BlockStatement, we will
+        just take those that are ExpressionStatement and we will
+        use it to find specific Assignment statements.
+
+        :param node: list with all the statements from a BlockStatement
+        :param field_name: field that we look for.
+        :return: list with all classes assigned to a given field.
+        """
+        ret_list = set()
+        for expression_statement in node:
+            if expression_statement[0] != 'ExpressionStatement':
+                continue
+
+            ret_val = self._find_assignments(
+                expression_statement[-1], field_name)
+
+            if ret_val is not None:
+                ret_list.add(ret_val)
+
+        return list(ret_list)
+
+    def _get_class_from_object_instantiation(self, field_object: FieldAnalysis):
+        """
+        Given a field, we will try to obtain through its references
+        where is initialized and which object instantiate this field/variable.
+        For example:
+
+        `android.os.Binder` is a base class that programmers extend to create
+        an interface than another application or component from same application
+        can use to call methods. So we get the uses of `android.os.Binder` and
+        see where is instantiated and from those, which one correspond to the
+        variable name.
+
+        :param field_object: Field that we will analyze to get its references and obtain the real object
+        :return: [ClassAnalysis]
+        """
+        instantiated_classes = set()
+        field_references = field_object.get_xref_write(True)
+
+        for class_, method_, offset in field_references:
+
+            encoded_method = method_.get_method()
+
+            method_ast = self.decompiler.get_ast_method(encoded_method)
+
+            method_body = method_ast['body']
+
+            if method_body[0] == 'BlockStatement':
+                instantiated_classes.update(self._analyze_blockstatement(
+                    method_body[-1], str(field_object.name)))
+
+        return list(instantiated_classes)
+
     def _get_method_returned_classes(self, method_object: MethodAnalysis):
         '''
         Methods such as onBind are used by Services to return a Bind object
@@ -429,13 +539,33 @@ class IntentFilterAnalyzer:
                         2][2]
                     # "where_is_stored->var_name var_type"
                     # retrieve only the var_type
+                    base_class = class_return_str.split('->')[0]
+                    field_name = class_return_str.split('->')[1].split(' ')[0]
+
                     class_return_str = class_return_str.split(' ')[1]
 
                     class_object = self._get_class_from_analysis(
                         class_return_str)
 
                     if class_object is None or class_object.is_android_api() or class_object.is_external():
-                        class_object = None
+                        fields = self._get_class_from_analysis(
+                            base_class).get_fields()
+                        field_for_analysis = None
+                        for f in fields:
+                            if str(f.name) == field_name:
+                                field_for_analysis = f
+                                break
+
+                        if field_for_analysis is None:
+                            class_object = None
+                        else:
+                            returned_value = self._get_class_from_object_instantiation(
+                                field_for_analysis)
+                            if len(returned_value) > 0:
+                                class_object = self._get_class_from_analysis(
+                                    "L" + returned_value[0] + ";")
+                            else:
+                                class_object = None
                     else:
                         Debug.log("Found class instance returned by method '%s'" % (
                             str(class_object.name)))
@@ -561,23 +691,24 @@ class IntentFilterAnalyzer:
         # are returned by onBind method
         for class_ in returned_classes:
             for method in class_.get_methods():
-                if method.is_external():
-                    # as the returned classes are interfaces
-                    # return the external methods
-                    descriptor = method.descriptor
+                # REMOVED FOR THE MOMENT
+                # if method.is_external():
+                # as the returned classes are interfaces
+                # return the external methods
+                descriptor = method.descriptor
 
-                    # get the return type
-                    ret_type = self._get_types_as_list(
-                        descriptor.split(')')[1])[0]
-                    parameters = self._get_types_as_list(
-                        descriptor.split(')')[0])
+                # get the return type
+                ret_type = self._get_types_as_list(
+                    descriptor.split(')')[1])[0]
+                parameters = self._get_types_as_list(
+                    descriptor.split(')')[0])
 
-                    method_prototypes.append(
-                        {str(method.name): {
-                            "return-type": ret_type,
-                            "parameters": parameters
-                        }}
-                    )
+                method_prototypes.append(
+                    {str(method.name): {
+                        "return-type": ret_type,
+                        "parameters": parameters
+                    }}
+                )
 
         return method_prototypes
 
@@ -749,6 +880,7 @@ class PermissionTracer:
         """
         self.MAX_DEPTH = 7          # constant value
         self.apk = None             # value that must be set only once by __androguard_open_apk
+        self.classes_dex = None     # value that must be set only once by __androguard_open_apk
         self.analysis = None        # value that must be set only once by __androguard_open_apk
         self.analysis_ok = False    # value that must be set only once by __androguard_open_apk
         self._md5 = md5
@@ -758,7 +890,7 @@ class PermissionTracer:
 
         if self.analysis_ok:
             self.intent_filter_analyzer = IntentFilterAnalyzer(
-                apk_analysis=self.analysis, apk=self.apk)
+                apk_analysis=self.analysis, apk=self.apk, classes_dex=self.classes_dex)
 
     def __read_md5_odex_file(self):
         return pickle.load(open(config['PATHS']['MD5-ODEX-PICKLE'], 'rb'))
@@ -864,7 +996,8 @@ class PermissionTracer:
         """
         Debug.log("analyzing %s file with androguard" % (APK))
         try:
-            self.apk, _, self.analysis = self.__androguard_analyze_apk(APK)
+            self.apk, self.classes_dex, self.analysis = self.__androguard_analyze_apk(
+                APK)
         except Exception as e:
             Debug.warning("Error analyzing apk with androguard", e)
             self.permission_analysis = {
