@@ -466,7 +466,7 @@ class IntentFilterAnalyzer:
         instantiated_classes = set()
         field_references = field_object.get_xref_write(True)
 
-        for class_, method_, offset in field_references:
+        for _, method_, _ in field_references:
 
             encoded_method = method_.get_method()
 
@@ -542,15 +542,26 @@ class IntentFilterAnalyzer:
                     base_class = class_return_str.split('->')[0]
                     field_name = class_return_str.split('->')[1].split(' ')[0]
 
+                    # get class of returned object
                     class_return_str = class_return_str.split(' ')[1]
 
+                    # try to obtain a ClassAnalysis from its name
                     class_object = self._get_class_from_analysis(
                         class_return_str)
 
+                    # if no class object were returned or is part of Android AOSP
                     if class_object is None or class_object.is_android_api() or class_object.is_external():
+                        # Improved the analysis, commonly an android.os.Binder is returned
+                        # but this is extended with other classes, try to get those classes:
+
+                        # Obtain the field object for this variable
+                        # this field object will allow us to obtain
+                        # cross references to know where is written.
                         fields = self._get_class_from_analysis(
                             base_class).get_fields()
+                        
                         field_for_analysis = None
+                        
                         for f in fields:
                             if str(f.name) == field_name:
                                 field_for_analysis = f
@@ -673,6 +684,8 @@ class IntentFilterAnalyzer:
 
         class_object = self._get_class_from_analysis(class_name)
         method_prototypes = []
+        method_hashes = []
+
 
         if class_object is None:
             return []
@@ -703,12 +716,26 @@ class IntentFilterAnalyzer:
                 parameters = self._get_types_as_list(
                     descriptor.split(')')[0])
 
-                method_prototypes.append(
-                    {str(method.name): {
-                        "return-type": ret_type,
-                        "parameters": parameters
-                    }}
-                )
+                # avoid copies taking care of name of method
+                # parameters and strings
+                str_hash = str(method.name)
+
+                for param in parameters:
+                    str_hash += str(param)
+                
+                str_hash += str(ret_type)
+
+                hash_ = hash(str_hash)
+
+                if hash_ not in method_hashes:
+                    method_prototypes.append(
+                        {str(method.name): {
+                            "return-type": ret_type,
+                            "parameters": parameters
+                        }}
+                    )
+
+                    method_hashes.append(hash_)
 
         return method_prototypes
 
