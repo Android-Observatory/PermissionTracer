@@ -132,12 +132,16 @@ class StringAnalyzer:
                     self.strings.add(str(string.get_orig_value()))
                     break
         
+        self.strings = self.strings - self.field_names
+        self.strings = self.strings - self.method_names
+        self.strings = self.strings - set(self.class_name)
+
         self.keywords = set()
 
         if file_path and len(file_path) > 0:
             with open(file_path, 'r') as keys_file:
                 for line in keys_file.readlines():
-                    self.keywords.add(line)
+                    self.keywords.add(line.strip().replace('\n',''))
             
     def analyze_class_name(self):
         """
@@ -147,13 +151,10 @@ class StringAnalyzer:
         """
         return_value = {"class_string_analysis": dict()}
 
-        return_value["class_string_analysis"] = {self.class_name:dict()}
-
         for keyword in self.keywords:
-            if keyword in self.class_name:
-                return_value["class_string_analysis"][self.class_name][keyword] = {"present": True, "index": self.class_name.index(keyword)}
-            else:
-                return_value["class_string_analysis"][self.class_name][keyword] = {"present": False, "index": -1}
+            if keyword.lower() in self.class_name.lower():
+                return_value["class_string_analysis"] = {self.class_name:dict()}
+                return_value["class_string_analysis"][self.class_name][keyword] = {"index": self.class_name.lower().index(keyword.lower())}
 
         return return_value
 
@@ -166,12 +167,11 @@ class StringAnalyzer:
         return_value = {"method_string_analysis": dict()}
 
         for method in self.method_names:
-            return_value["method_string_analysis"] = {method:dict()}
             for keyword in self.keywords:
-                if keyword in method:
-                    return_value["method_string_analysis"][method][keyword] = {"present": True, "index": method.index(keyword)}
-                else:
-                    return_value["method_string_analysis"][method][keyword] = {"present": False, "index": -1}
+                if keyword.lower() in method.lower():
+                    return_value["method_string_analysis"] = {method:dict()}
+                    return_value["method_string_analysis"][method][keyword] = {}
+                    return_value["method_string_analysis"][method][keyword] = {"index": method.lower().index(keyword.lower())}
 
         return return_value
 
@@ -184,12 +184,11 @@ class StringAnalyzer:
         return_value = {"field_string_analysis": dict()}
 
         for field in self.field_names:
-            return_value["field_string_analysis"] = {field:dict()}
             for keyword in self.keywords:
-                if keyword in field:
-                    return_value["field_string_analysis"][field][keyword] = {"present": True, "index": field.index(keyword)}
-                else:
-                    return_value["field_string_analysis"][field][keyword] = {"present": False, "index": -1}
+                if keyword.lower() in field.lower():
+                    return_value["field_string_analysis"] = {field:dict()}
+                    return_value["field_string_analysis"][field][keyword] = {}
+                    return_value["field_string_analysis"][field][keyword] = {"index": field.lower().index(keyword.lower())}
 
         return return_value
     
@@ -201,14 +200,13 @@ class StringAnalyzer:
         """
         return_value = {"raw_String_analysis": dict()}
 
-        for string in self.strings:
-            return_value["raw_String_analysis"] = {string:dict()}
+        for string in self.strings:            
             for keyword in self.keywords:
-                if keyword in string:
-                    return_value["field_string_analysis"][string][keyword] = {"present": True, "index": string.index(keyword)}
-                else:
-                    return_value["field_string_analysis"][string][keyword] = {"present": False, "index": -1}
-        
+                if keyword.lower() in string.lower():
+                    return_value["raw_String_analysis"] = {string:dict()}
+                    return_value["raw_String_analysis"][string][keyword] = {}
+                    return_value["raw_String_analysis"][string][keyword] = {"index": string.lower().index(keyword.lower())}
+                
         return return_value
 
 
@@ -1476,10 +1474,13 @@ class PermissionTracer:
         self.permission_analysis.update(component_type)
         
         if self.key_file:
-            self.permission_analysis.update(self.string_analyzer.analyze_class_name())
-            self.permission_analysis.update(self.string_analyzer.analyze_methods())
-            self.permission_analysis.update(self.string_analyzer.analyze_fields())
-            self.permission_analysis.update(self.string_analyzer.analyze_strings())
+            string_analysis = {'string_analysis' : dict()}
+            string_analysis['string_analysis'].update(self.string_analyzer.analyze_class_name())
+            string_analysis['string_analysis'].update(self.string_analyzer.analyze_methods())
+            string_analysis['string_analysis'].update(self.string_analyzer.analyze_fields())
+            string_analysis['string_analysis'].update(self.string_analyzer.analyze_strings())
+            self.permission_analysis.update(string_analysis)
+
 
 
 def writeOutput(info):
