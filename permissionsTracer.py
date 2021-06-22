@@ -100,6 +100,117 @@ class Debug:
                   (datetime.datetime.now(), msg, str(error)))
         raise exception(msg)
 
+class StringAnalyzer:
+
+    def __init__(self, analysis_object: Analysis, class_object: ClassAnalysis, file_path: str = None):
+        """
+        Constructor of StringAnalyzer this class will
+        get all the strings from the class wherever this
+        strings come from (static fields, method names,
+        class names, strings in the code), then we will
+        try to match them with those from a specified file.
+        
+        :param analysis_object: Analysis object to get all the strings from the apk.
+        :param class_object: ClassAnalysis object to get the information from the class.
+        :param file_path: path to the file with the list of strings to search.
+        """
+        self.class_name = str(class_object.name)
+        self.method_names = set()
+        self.field_names = set()
+        self.strings = set()
+
+        for method in class_object.get_methods():
+            self.method_names.add(str(method.name))
+
+        for field in class_object.get_fields():
+            self.field_names.add(str(field.name))
+
+        for string in analysis_object.get_strings():
+            string_xrefs = string.get_xref_from()
+            for xref in string_xrefs:
+                if str(xref[0].name) == self.class_name:
+                    self.strings.add(str(string.get_orig_value()))
+                    break
+        
+        self.keywords = set()
+
+        if file_path and len(file_path) > 0:
+            with open(file_path, 'r') as keys_file:
+                for line in keys_file.readlines():
+                    self.keywords.add(line)
+            
+    def analyze_class_name(self):
+        """
+        Search in the class name all the keywords and get the index.
+
+        :return: dict
+        """
+        return_value = {"class_string_analysis": dict()}
+
+        return_value["class_string_analysis"] = {self.class_name:dict()}
+
+        for keyword in self.keywords:
+            if keyword in self.class_name:
+                return_value["class_string_analysis"][self.class_name][keyword] = {"present": True, "index": self.class_name.index(keyword)}
+            else:
+                return_value["class_string_analysis"][self.class_name][keyword] = {"present": False, "index": -1}
+
+        return return_value
+
+    def analyze_methods(self):
+        """
+        Search in all the method names all the keywords and get the index.
+
+        :return: dict
+        """
+        return_value = {"method_string_analysis": dict()}
+
+        for method in self.method_names:
+            return_value["method_string_analysis"] = {method:dict()}
+            for keyword in self.keywords:
+                if keyword in method:
+                    return_value["method_string_analysis"][method][keyword] = {"present": True, "index": method.index(keyword)}
+                else:
+                    return_value["method_string_analysis"][method][keyword] = {"present": False, "index": -1}
+
+        return return_value
+
+    def analyze_fields(self):
+        """
+        Search in all the field names all the keywords and get the index.
+
+        :return: dict
+        """
+        return_value = {"field_string_analysis": dict()}
+
+        for field in self.field_names:
+            return_value["field_string_analysis"] = {field:dict()}
+            for keyword in self.keywords:
+                if keyword in field:
+                    return_value["field_string_analysis"][field][keyword] = {"present": True, "index": field.index(keyword)}
+                else:
+                    return_value["field_string_analysis"][field][keyword] = {"present": False, "index": -1}
+
+        return return_value
+    
+    def analyze_strings(self):
+        """
+        Search in all the raw strings all the keywords and get the index.
+
+        :return: dict
+        """
+        return_value = {"raw_String_analysis": dict()}
+
+        for string in self.strings:
+            return_value["raw_String_analysis"] = {string:dict()}
+            for keyword in self.keywords:
+                if keyword in string:
+                    return_value["field_string_analysis"][string][keyword] = {"present": True, "index": string.index(keyword)}
+                else:
+                    return_value["field_string_analysis"][string][keyword] = {"present": False, "index": -1}
+        
+        return return_value
+
 
 class IntentFilterAnalyzer:
     # Supported component types for analysis
@@ -896,7 +1007,7 @@ class IntentFilterAnalyzer:
 
 class PermissionTracer:
 
-    def __init__(self, APK, md5):
+    def __init__(self, APK, md5, key_file: str = None):
         """
         Constructor method for PermissionTracer class, it will store and
         initialize variables, also it will call some starting methods.
@@ -912,6 +1023,8 @@ class PermissionTracer:
         self.analysis_ok = False    # value that must be set only once by __androguard_open_apk
         self._md5 = md5
         self.intent_filter_analyzer = None
+        self.string_analyzer = None
+        self.key_file = key_file
 
         self.__androguard_open_apk(APK)
 
@@ -1339,6 +1452,12 @@ class PermissionTracer:
         if not self.methods_objects_start or len(self.methods_objects_start) == 0:
             Debug.warning("Error obtaining methods from %s" %
                           (self.class_name), 2)
+        
+        class_object = self.analysis.get_class_analysis(self.class_name)
+
+        # initialize the string analysis object
+        self.string_analyzer = StringAnalyzer(self.analysis, class_object, self.key_file)
+
 
     def analyze(self):
         Debug.log("Starting the analysis!!!")
@@ -1355,6 +1474,12 @@ class PermissionTracer:
         self.permission_analysis.update(exposed_methods)
         self.permission_analysis.update(data_provided)
         self.permission_analysis.update(component_type)
+        
+        if self.key_file:
+            self.permission_analysis.update(self.string_analyzer.analyze_class_name())
+            self.permission_analysis.update(self.string_analyzer.analyze_methods())
+            self.permission_analysis.update(self.string_analyzer.analyze_fields())
+            self.permission_analysis.update(self.string_analyzer.analyze_strings())
 
 
 def writeOutput(info):
@@ -1388,6 +1513,7 @@ def main():
     global FILE_NAME
 
     permissionTracer = None
+    strings_dump_file = None
 
     parser = argparse.ArgumentParser(
         description="PermissionTracer tool to extract aosp permissions from methods protected by custom permissions")
@@ -1407,6 +1533,10 @@ def main():
                         help="Class with the method to analyze (format package/package/class)", required=True)
     parser.add_argument("-o", "--output", type=str,
                         help="Specify output json file (stdout if not specified)")
+    parser.add_argument("--dump-strings", type=str,
+                        help="Dump the strings from the analyzed class")
+    parser.add_argument("--key-file", type=str,
+                        help="File with strings to search in analyzed class, one string per line")
     args = parser.parse_args()
 
     if args.debug:
@@ -1437,17 +1567,37 @@ def main():
 
     results = dict()
 
-    permissionTracer = PermissionTracer(args.input, args.md5hash)
+    if args.key_file:
+        permissionTracer = PermissionTracer(args.input, args.md5hash, args.key_file)
+    else:    
+        permissionTracer = PermissionTracer(args.input, args.md5hash)
+
+    if args.dump_strings:
+        strings_dump_file = open(args.dump_strings, 'w')
 
     for item in classes:
         # just if the analysis was correct
         if permissionTracer.analysis_ok:
             permissionTracer.set_class_to_analyze(item)
             permissionTracer.analyze()
+
+            if args.dump_strings:
+                strings_dump_file.write("Class Name: " + permissionTracer.string_analyzer.class_name + '\n')
+                for method in permissionTracer.string_analyzer.method_names:
+                    strings_dump_file.write("Method Name: " + method + '\n')
+                for field in permissionTracer.string_analyzer.field_names:
+                    strings_dump_file.write("Field Name: " + field + '\n')
+                for string in permissionTracer.string_analyzer.strings:
+                    strings_dump_file.write("Raw String: " + string + '\n')
+
         results[item] = permissionTracer.permission_analysis
+    
+    if args.dump_strings:
+        strings_dump_file.close()
 
     writeOutput(results)
 
+    
 
 if __name__ == '__main__':
     main()
