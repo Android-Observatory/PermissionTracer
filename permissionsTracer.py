@@ -1454,7 +1454,8 @@ class PermissionTracer:
         class_object = self.analysis.get_class_analysis(self.class_name)
 
         # initialize the string analysis object
-        self.string_analyzer = StringAnalyzer(self.analysis, class_object, self.key_file)
+        if class_object is not None:
+            self.string_analyzer = StringAnalyzer(self.analysis, class_object, self.key_file)
 
 
     def analyze(self):
@@ -1473,7 +1474,7 @@ class PermissionTracer:
         self.permission_analysis.update(data_provided)
         self.permission_analysis.update(component_type)
         
-        if self.key_file:
+        if self.key_file and self.string_analyzer is not None:
             string_analysis = {'string_analysis' : dict()}
             string_analysis['string_analysis'].update(self.string_analyzer.analyze_class_name())
             string_analysis['string_analysis'].update(self.string_analyzer.analyze_methods())
@@ -1582,7 +1583,7 @@ def main():
             permissionTracer.set_class_to_analyze(item)
             permissionTracer.analyze()
 
-            if args.dump_strings:
+            if args.dump_strings and permissionTracer.string_analyzer is not None:
                 strings_dump_file.write("Class Name: " + permissionTracer.string_analyzer.class_name + '\n')
                 for method in permissionTracer.string_analyzer.method_names:
                     strings_dump_file.write("Method Name: " + method + '\n')
